@@ -1,4 +1,42 @@
-// -*- mode:c++; fill-column: 100; -*-
+/*****************************************************************************
+**                                     __
+**                                    / _|
+**   __ _ _   _ _ __ ___  _ __ __ _  | |_ ___  ___ ___
+**  / _` | | | | '__/ _ \| '__/ _` | |  _/ _ \/ __/ __|
+** | (_| | |_| | | | (_) | | | (_| | | || (_) \__ \__ \
+**  \__,_|\__,_|_|  \___/|_|  \__,_| |_| \___/|___/___/
+**
+** Copyright (C) 2015-2016 Michael T. Boulet <boulet@ll.mit.edu>
+** Copyright (C) 2012-2014 Benjamin Vedder <benjamin@vedder.se>
+** Copyright (C) 2019 Aurora Free Open Source Software.
+** Copyright (C) 2019 Luís Ferreira <luis@aurorafoss.org>
+**
+** This file is part of the Aurora Free Open Source Software. This
+** organization promote free and open source software that you can
+** redistribute and/or modify under the terms of the GNU Lesser General
+** Public License Version 3 as published by the Free Software Foundation or
+** (at your option) any later version approved by the Aurora Free Open Source
+** Software Organization. The license is available in the package root path
+** as 'LICENSE' file. Please review the following information to ensure the
+** GNU Lesser General Public License version 3 requirements will be met:
+** https://www.gnu.org/licenses/lgpl.html .
+**
+** Alternatively, this file may be used under the terms of the GNU General
+** Public License version 3 or later as published by the Free Software
+** Foundation. Please review the following information to ensure the GNU
+** General Public License requirements will be met:
+** http://www.gnu.org/licenses/gpl-3.0.html.
+**
+** NOTE: All products, services or anything associated to trademarks and
+** service marks used or referenced on this file are the property of their
+** respective companies/owners or its subsidiaries. Other names and brands
+** may be claimed as the property of others.
+**
+** For more info about intellectual property visit: aurorafoss.org or
+** directly send an email to: contact (at) aurorafoss.org .
+**
+** This project was originally licensed under BSD.
+*****************************************************************************/
 
 #include "vesc_driver/vesc_driver.h"
 
@@ -11,138 +49,141 @@
 
 namespace vesc_driver
 {
+	VescDriver::VescDriver(ros::NodeHandle nh, ros::NodeHandle private_nh)
+		: vesc_(
+				std::string(),
+				boost::bind(&VescDriver::vescPacketCallback, this, _1),
+				boost::bind(&VescDriver::vescErrorCallback, this, _1)
+			),
+			duty_cycle_limit_(private_nh, "duty_cycle", -1.0, 1.0),
+			current_limit_(private_nh, "current"),
+			brake_limit_(private_nh, "brake"),
+			speed_limit_(private_nh, "speed"),
+			position_limit_(private_nh, "position"),
+			servo_limit_(private_nh, "servo", 0.0, 1.0),
+			driver_mode_(MODE_INITIALIZING),
+			fw_version_major_(-1),
+			fw_version_minor_(-1)
+	{
+		// get vesc serial port address
+		std::string port;
+		if (!private_nh.getParam("port", port)) {
+			ROS_FATAL("VESC communication port parameter required.");
+			ros::shutdown();
+			return;
+		}
 
-VescDriver::VescDriver(ros::NodeHandle nh,
-                       ros::NodeHandle private_nh) :
-  vesc_(std::string(),
-        boost::bind(&VescDriver::vescPacketCallback, this, _1),
-        boost::bind(&VescDriver::vescErrorCallback, this, _1)),
-  duty_cycle_limit_(private_nh, "duty_cycle", -1.0, 1.0), current_limit_(private_nh, "current"),
-  brake_limit_(private_nh, "brake"), speed_limit_(private_nh, "speed"),
-  position_limit_(private_nh, "position"), servo_limit_(private_nh, "servo", 0.0, 1.0),
-  driver_mode_(MODE_INITIALIZING), fw_version_major_(-1), fw_version_minor_(-1)
-{
-  // get vesc serial port address
-  std::string port;
-  if (!private_nh.getParam("port", port)) {
-    ROS_FATAL("VESC communication port parameter required.");
-    ros::shutdown();
-    return;
-  }
+		// attempt to connect to the serial port
+		try {
+			vesc_.connect(port);
+		}
+		catch (SerialException e) {
+			ROS_FATAL("Failed to connect to the VESC, %s.", e.what());
+			ros::shutdown();
+			return;
+		}
 
-  // attempt to connect to the serial port
-  try {
-    vesc_.connect(port);
-  }
-  catch (SerialException e) {
-    ROS_FATAL("Failed to connect to the VESC, %s.", e.what());
-    ros::shutdown();
-    return;
-  }
+		// create vesc state (telemetry) publisher
+		state_pub_ = nh.advertise<vesc_msgs::VescStateStamped>("sensors/core", 10);
 
-  // create vesc state (telemetry) publisher
-  state_pub_ = nh.advertise<vesc_msgs::VescStateStamped>("sensors/core", 10);
+		// since vesc state does not include the servo position, publish the commanded
+		// servo position as a "sensor"
+		servo_sensor_pub_ = nh.advertise<std_msgs::Float64>("sensors/servo_position_command", 10);
 
-  // since vesc state does not include the servo position, publish the commanded
-  // servo position as a "sensor"
-  servo_sensor_pub_ = nh.advertise<std_msgs::Float64>("sensors/servo_position_command", 10);
+		// subscribe to motor and servo command topics
+		duty_cycle_sub_ = nh.subscribe("commands/motor/duty_cycle", 10, &VescDriver::dutyCycleCallback, this);
+		current_sub_ = nh.subscribe("commands/motor/current", 10, &VescDriver::currentCallback, this);
+		brake_sub_ = nh.subscribe("commands/motor/brake", 10, &VescDriver::brakeCallback, this);
+		speed_sub_ = nh.subscribe("commands/motor/speed", 10, &VescDriver::speedCallback, this);
+		position_sub_ = nh.subscribe("commands/motor/position", 10, &VescDriver::positionCallback, this);
+		servo_sub_ = nh.subscribe("commands/servo/position", 10, &VescDriver::servoCallback, this);
 
-  // subscribe to motor and servo command topics
-  duty_cycle_sub_ = nh.subscribe("commands/motor/duty_cycle", 10,
-                                 &VescDriver::dutyCycleCallback, this);
-  current_sub_ = nh.subscribe("commands/motor/current", 10, &VescDriver::currentCallback, this);
-  brake_sub_ = nh.subscribe("commands/motor/brake", 10, &VescDriver::brakeCallback, this);
-  speed_sub_ = nh.subscribe("commands/motor/speed", 10, &VescDriver::speedCallback, this);
-  position_sub_ = nh.subscribe("commands/motor/position", 10, &VescDriver::positionCallback, this);
-  servo_sub_ = nh.subscribe("commands/servo/position", 10, &VescDriver::servoCallback, this);
+		// create a 50Hz timer, used for state machine & polling VESC telemetry
+		timer_ = nh.createTimer(ros::Duration(1.0/50.0), &VescDriver::timerCallback, this);
+	}
 
-  // create a 50Hz timer, used for state machine & polling VESC telemetry
-  timer_ = nh.createTimer(ros::Duration(1.0/50.0), &VescDriver::timerCallback, this);
-}
-
-  /* TODO or TO-THINKABOUT LIST
-    - what should we do on startup? send brake or zero command?
-    - what to do if the vesc interface gives an error?
-    - check version number against know compatable?
-    - should we wait until we receive telemetry before sending commands?
-    - should we track the last motor command
-    - what to do if no motor command received recently?
-    - what to do if no servo command received recently?
-    - what is the motor safe off state (0 current?)
-    - what to do if a command parameter is out of range, ignore?
-    - try to predict vesc bounds (from vesc config) and command detect bounds errors
-  */
+	/* TODO or TO-THINKABOUT LIST
+		- what should we do on startup? send brake or zero command?
+		- what to do if the vesc interface gives an error?
+		- check version number against know compatable?
+		- should we wait until we receive telemetry before sending commands?
+		- should we track the last motor command
+		- what to do if no motor command received recently?
+		- what to do if no servo command received recently?
+		- what is the motor safe off state (0 current?)
+		- what to do if a command parameter is out of range, ignore?
+		- try to predict vesc bounds (from vesc config) and command detect bounds errors
+	*/
 
 void VescDriver::timerCallback(const ros::TimerEvent& event)
 {
-  // VESC interface should not unexpectedly disconnect, but test for it anyway
-  if (!vesc_.isConnected()) {
-    ROS_FATAL("Unexpectedly disconnected from serial port.");
-    timer_.stop();
-    ros::shutdown();
-    return;
-  }
+	// VESC interface should not unexpectedly disconnect, but test for it anyway
+	if (!vesc_.isConnected()) {
+		ROS_FATAL("Unexpectedly disconnected from serial port.");
+		timer_.stop();
+		ros::shutdown();
+		return;
+	}
 
-  /*
-   * Driver state machine, modes:
-   *  INITIALIZING - request and wait for vesc version
-   *  OPERATING - receiving commands from subscriber topics
-   */
-  if (driver_mode_ == MODE_INITIALIZING) {
-    // request version number, return packet will update the internal version numbers
-    vesc_.requestFWVersion();
-    if (fw_version_major_ >= 0 && fw_version_minor_ >= 0) {
-      ROS_INFO("Connected to VESC with firmware version %d.%d",
-               fw_version_major_, fw_version_minor_);
-      driver_mode_ = MODE_OPERATING;
-    }
-  }
-  else if (driver_mode_ == MODE_OPERATING) {
-    // poll for vesc state (telemetry)
-    vesc_.requestState();
-  }
-  else {
-    // unknown mode, how did that happen?
-    assert(false && "unknown driver mode");
-  }
+	/*
+	 * Driver state machine, modes:
+	 *  INITIALIZING - request and wait for vesc version
+	 *  OPERATING - receiving commands from subscriber topics
+	 */
+	if (driver_mode_ == MODE_INITIALIZING) {
+		// request version number, return packet will update the internal version numbers
+		vesc_.requestFWVersion();
+		if (fw_version_major_ >= 0 && fw_version_minor_ >= 0) {
+			ROS_INFO("Connected to VESC with firmware version %d.%d", fw_version_major_, fw_version_minor_);
+			driver_mode_ = MODE_OPERATING;
+		}
+	}
+	else if (driver_mode_ == MODE_OPERATING) {
+		// poll for vesc state (telemetry)
+		vesc_.requestState();
+	}
+	else {
+		// unknown mode, how did that happen?
+		assert(false && "unknown driver mode");
+	}
 }
 
 void VescDriver::vescPacketCallback(const boost::shared_ptr<VescPacket const>& packet)
 {
-  if (packet->name() == "Values") {
-    boost::shared_ptr<VescPacketValues const> values =
-      boost::dynamic_pointer_cast<VescPacketValues const>(packet);
+	if (packet->name() == "Values") {
+		boost::shared_ptr<VescPacketValues const> values =
+			boost::dynamic_pointer_cast<VescPacketValues const>(packet);
 
-    vesc_msgs::VescStateStamped::Ptr state_msg(new vesc_msgs::VescStateStamped);
-    state_msg->header.stamp = ros::Time::now();
-    state_msg->state.voltage_input = values->v_in();
-    state_msg->state.temperature_pcb = values->temp_pcb();
-    state_msg->state.current_motor = values->current_motor();
-    state_msg->state.current_input = values->current_in();
-    state_msg->state.speed = values->rpm();
-    state_msg->state.duty_cycle = values->duty_now();
-    state_msg->state.charge_drawn = values->amp_hours();
-    state_msg->state.charge_regen = values->amp_hours_charged();
-    state_msg->state.energy_drawn = values->watt_hours();
-    state_msg->state.energy_regen = values->watt_hours_charged();
-    state_msg->state.displacement = values->tachometer();
-    state_msg->state.distance_traveled = values->tachometer_abs();
-    state_msg->state.fault_code = values->fault_code();
+		vesc_msgs::VescStateStamped::Ptr state_msg(new vesc_msgs::VescStateStamped);
+		state_msg->header.stamp = ros::Time::now();
+		state_msg->state.voltage_input = values->v_in();
+		state_msg->state.temperature_pcb = values->temp_pcb();
+		state_msg->state.current_motor = values->current_motor();
+		state_msg->state.current_input = values->current_in();
+		state_msg->state.speed = values->rpm();
+		state_msg->state.duty_cycle = values->duty_now();
+		state_msg->state.charge_drawn = values->amp_hours();
+		state_msg->state.charge_regen = values->amp_hours_charged();
+		state_msg->state.energy_drawn = values->watt_hours();
+		state_msg->state.energy_regen = values->watt_hours_charged();
+		state_msg->state.displacement = values->tachometer();
+		state_msg->state.distance_traveled = values->tachometer_abs();
+		state_msg->state.fault_code = values->fault_code();
 
-    state_pub_.publish(state_msg);
-  }
-  else if (packet->name() == "FWVersion") {
-    boost::shared_ptr<VescPacketFWVersion const> fw_version =
-      boost::dynamic_pointer_cast<VescPacketFWVersion const>(packet);
-    // todo: might need lock here
-    fw_version_major_ = fw_version->fwMajor();
-    fw_version_minor_ = fw_version->fwMinor();
-  }
+		state_pub_.publish(state_msg);
+	}
+	else if (packet->name() == "FWVersion") {
+		boost::shared_ptr<VescPacketFWVersion const> fw_version =
+			boost::dynamic_pointer_cast<VescPacketFWVersion const>(packet);
+		// todo: might need lock here
+		fw_version_major_ = fw_version->fwMajor();
+		fw_version_minor_ = fw_version->fwMinor();
+	}
 }
 
 void VescDriver::vescErrorCallback(const std::string& error)
 {
-  ROS_ERROR("%s", error.c_str());
+	ROS_ERROR("%s", error.c_str());
 }
 
 /**
@@ -152,9 +193,9 @@ void VescDriver::vescErrorCallback(const std::string& error)
  */
 void VescDriver::dutyCycleCallback(const std_msgs::Float64::ConstPtr& duty_cycle)
 {
-  if (driver_mode_ = MODE_OPERATING) {
-    vesc_.setDutyCycle(duty_cycle_limit_.clip(duty_cycle->data));
-  }
+	if (driver_mode_ = MODE_OPERATING) {
+		vesc_.setDutyCycle(duty_cycle_limit_.clip(duty_cycle->data));
+	}
 }
 
 /**
@@ -164,9 +205,9 @@ void VescDriver::dutyCycleCallback(const std_msgs::Float64::ConstPtr& duty_cycle
  */
 void VescDriver::currentCallback(const std_msgs::Float64::ConstPtr& current)
 {
-  if (driver_mode_ = MODE_OPERATING) {
-    vesc_.setCurrent(current_limit_.clip(current->data));
-  }
+	if (driver_mode_ = MODE_OPERATING) {
+		vesc_.setCurrent(current_limit_.clip(current->data));
+	}
 }
 
 /**
@@ -176,9 +217,9 @@ void VescDriver::currentCallback(const std_msgs::Float64::ConstPtr& current)
  */
 void VescDriver::brakeCallback(const std_msgs::Float64::ConstPtr& brake)
 {
-  if (driver_mode_ = MODE_OPERATING) {
-    vesc_.setBrake(brake_limit_.clip(brake->data));
-  }
+	if (driver_mode_ = MODE_OPERATING) {
+		vesc_.setBrake(brake_limit_.clip(brake->data));
+	}
 }
 
 /**
@@ -189,9 +230,9 @@ void VescDriver::brakeCallback(const std_msgs::Float64::ConstPtr& brake)
  */
 void VescDriver::speedCallback(const std_msgs::Float64::ConstPtr& speed)
 {
-  if (driver_mode_ = MODE_OPERATING) {
-    vesc_.setSpeed(speed_limit_.clip(speed->data));
-  }
+	if (driver_mode_ = MODE_OPERATING) {
+		vesc_.setSpeed(speed_limit_.clip(speed->data));
+	}
 }
 
 /**
@@ -200,11 +241,11 @@ void VescDriver::speedCallback(const std_msgs::Float64::ConstPtr& speed)
  */
 void VescDriver::positionCallback(const std_msgs::Float64::ConstPtr& position)
 {
-  if (driver_mode_ = MODE_OPERATING) {
-    // ROS uses radians but VESC seems to use degrees. Convert to degrees.
-    double position_deg = position_limit_.clip(position->data) * 180.0 / M_PI;
-    vesc_.setPosition(position_deg);
-  }
+	if (driver_mode_ = MODE_OPERATING) {
+		// ROS uses radians but VESC seems to use degrees. Convert to degrees.
+		double position_deg = position_limit_.clip(position->data) * 180.0 / M_PI;
+		vesc_.setPosition(position_deg);
+	}
 }
 
 /**
@@ -212,92 +253,92 @@ void VescDriver::positionCallback(const std_msgs::Float64::ConstPtr& position)
  */
 void VescDriver::servoCallback(const std_msgs::Float64::ConstPtr& servo)
 {
-  if (driver_mode_ = MODE_OPERATING) {
-    double servo_clipped(servo_limit_.clip(servo->data));
-    vesc_.setServo(servo_clipped);
-    // publish clipped servo value as a "sensor"
-    std_msgs::Float64::Ptr servo_sensor_msg(new std_msgs::Float64);
-    servo_sensor_msg->data = servo_clipped;
-    servo_sensor_pub_.publish(servo_sensor_msg);
-  }
+	if (driver_mode_ = MODE_OPERATING) {
+		double servo_clipped(servo_limit_.clip(servo->data));
+		vesc_.setServo(servo_clipped);
+		// publish clipped servo value as a "sensor"
+		std_msgs::Float64::Ptr servo_sensor_msg(new std_msgs::Float64);
+		servo_sensor_msg->data = servo_clipped;
+		servo_sensor_pub_.publish(servo_sensor_msg);
+	}
 }
 
 VescDriver::CommandLimit::CommandLimit(const ros::NodeHandle& nh, const std::string& str,
-                                       const boost::optional<double>& min_lower,
-                                       const boost::optional<double>& max_upper) :
-  name(str)
+																			 const boost::optional<double>& min_lower,
+																			 const boost::optional<double>& max_upper) :
+	name(str)
 {
-  // check if user's minimum value is outside of the range min_lower to max_upper
-  double param_min;
-  if (nh.getParam(name + "_min", param_min)) {
-    if (min_lower && param_min < *min_lower) {
-      lower = *min_lower;
-      ROS_WARN_STREAM("Parameter " << name << "_min (" << param_min <<
-                      ") is less than the feasible minimum (" << *min_lower << ").");
-    }
-    else if (max_upper && param_min > *max_upper) {
-      lower = *max_upper;
-      ROS_WARN_STREAM("Parameter " << name << "_min (" << param_min <<
-                      ") is greater than the feasible maximum (" << *max_upper << ").");
-    }
-    else {
-      lower = param_min;
-    }
-  }
-  else if (min_lower) {
-    lower = *min_lower;
-  }
+	// check if user's minimum value is outside of the range min_lower to max_upper
+	double param_min;
+	if (nh.getParam(name + "_min", param_min)) {
+		if (min_lower && param_min < *min_lower) {
+			lower = *min_lower;
+			ROS_WARN_STREAM("Parameter " << name << "_min (" << param_min <<
+											") is less than the feasible minimum (" << *min_lower << ").");
+		}
+		else if (max_upper && param_min > *max_upper) {
+			lower = *max_upper;
+			ROS_WARN_STREAM("Parameter " << name << "_min (" << param_min <<
+											") is greater than the feasible maximum (" << *max_upper << ").");
+		}
+		else {
+			lower = param_min;
+		}
+	}
+	else if (min_lower) {
+		lower = *min_lower;
+	}
 
-  // check if the uers' maximum value is outside of the range min_lower to max_upper
-  double param_max;
-  if (nh.getParam(name + "_max", param_max)) {
-    if (min_lower && param_max < *min_lower) {
-      upper = *min_lower;
-      ROS_WARN_STREAM("Parameter " << name << "_max (" << param_max <<
-                      ") is less than the feasible minimum (" << *min_lower << ").");
-    }
-    else if (max_upper && param_max > *max_upper) {
-      upper = *max_upper;
-      ROS_WARN_STREAM("Parameter " << name << "_max (" << param_max <<
-                      ") is greater than the feasible maximum (" << *max_upper << ").");
-    }
-    else {
-      upper = param_max;
-    }
-  }
-  else if (max_upper) {
-    upper = *max_upper;
-  }
+	// check if the uers' maximum value is outside of the range min_lower to max_upper
+	double param_max;
+	if (nh.getParam(name + "_max", param_max)) {
+		if (min_lower && param_max < *min_lower) {
+			upper = *min_lower;
+			ROS_WARN_STREAM("Parameter " << name << "_max (" << param_max <<
+											") is less than the feasible minimum (" << *min_lower << ").");
+		}
+		else if (max_upper && param_max > *max_upper) {
+			upper = *max_upper;
+			ROS_WARN_STREAM("Parameter " << name << "_max (" << param_max <<
+											") is greater than the feasible maximum (" << *max_upper << ").");
+		}
+		else {
+			upper = param_max;
+		}
+	}
+	else if (max_upper) {
+		upper = *max_upper;
+	}
 
-  // check for min > max
-  if (upper && lower && *lower > *upper) {
-    ROS_WARN_STREAM("Parameter " << name << "_max (" << *upper
-                    << ") is less than parameter " << name << "_min (" << *lower << ").");
-    double temp(*lower);
-    lower = *upper;
-    upper = temp;
-  }
+	// check for min > max
+	if (upper && lower && *lower > *upper) {
+		ROS_WARN_STREAM("Parameter " << name << "_max (" << *upper
+										<< ") is less than parameter " << name << "_min (" << *lower << ").");
+		double temp(*lower);
+		lower = *upper;
+		upper = temp;
+	}
 
-  std::ostringstream oss;
-  oss << "  " << name << " limit: ";
-  if (lower) oss << *lower << " "; else oss << "(none) ";
-  if (upper) oss << *upper; else oss << "(none)";
-  ROS_DEBUG_STREAM(oss.str());
+	std::ostringstream oss;
+	oss << "  " << name << " limit: ";
+	if (lower) oss << *lower << " "; else oss << "(none) ";
+	if (upper) oss << *upper; else oss << "(none)";
+	ROS_DEBUG_STREAM(oss.str());
 }
 
 double VescDriver::CommandLimit::clip(double value)
 {
-  if (lower && value < lower) {
-    ROS_INFO_THROTTLE(10, "%s command value (%f) below minimum limit (%f), clipping.",
-                      name.c_str(), value, *lower);
-    return *lower;
-  }
-  if (upper && value > upper) {
-    ROS_INFO_THROTTLE(10, "%s command value (%f) above maximum limit (%f), clipping.",
-                      name.c_str(), value, *upper);
-    return *upper;
-  }
-  return value;
+	if (lower && value < lower) {
+		ROS_INFO_THROTTLE(10, "%s command value (%f) below minimum limit (%f), clipping.",
+											name.c_str(), value, *lower);
+		return *lower;
+	}
+	if (upper && value > upper) {
+		ROS_INFO_THROTTLE(10, "%s command value (%f) above maximum limit (%f), clipping.",
+											name.c_str(), value, *upper);
+		return *upper;
+	}
+	return value;
 }
 
 
